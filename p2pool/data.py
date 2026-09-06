@@ -1,5 +1,7 @@
+# -*- coding: utf-8 -*-
 from __future__ import division
 
+import collections
 import hashlib
 import os
 import random
@@ -13,6 +15,25 @@ from twisted.python import log
 import p2pool
 from p2pool.bitcoin import data as bitcoin_data, script, sha256
 from p2pool.util import math, forest, pack
+
+
+class DeterministicShareCheckFailure(ValueError):
+    '''Raised by Share.check() for a rejection that is a pure function of the
+    share's own immutable content plus its already-present (immutable) ancestor
+    shares' PPLNS weights -- e.g. the V36 merged-coinbase / merkle / gentx-hash
+    mismatch.  Such a verdict can NEVER change on a later re-check, so the
+    OkayTracker may negatively-cache it and skip the (expensive) re-computation.
+
+    It subclasses ValueError so every existing ``except ValueError`` handler
+    around check() keeps its old behaviour byte-for-byte; only attempt_verify
+    inspects the concrete type to decide whether to cache.
+
+    TRANSIENT failures (missing parent, chain-not-long-enough, timestamp-in-the-
+    future, missing known_txs, incomplete-height AssertionError) MUST NOT be
+    raised as this type -- they can succeed once more data arrives, so they stay
+    plain ValueError / KeyError / AssertionError and are never cached.'''
+    pass
+
 
 # DOA-under-load fix (G1): module-level L1 cache of tx-set artifacts
 # (see BaseShare._get_txset_artifacts).
@@ -1085,7 +1106,19 @@ class BaseShare(object):
                       ) if cls.VERSION < 32 else
                       max(desired_timestamp, (previous_share.timestamp + 1)) if previous_share is not None else desired_timestamp,
             absheight=((previous_share.absheight if previous_share is not None else 0) + 1) % 2**32,
-            abswork=((previous_share.abswork if previous_share is not None else 0) + bitcoin_data.target_to_average_attempts(bits.target)) % 2**128,
+            # abswork is a wrapping cumulative-work counter (same idiom as the
+            # absheight % 2**32 wrap above).  V36 serializes abswork as
+            # VarIntType, whose wire ceiling is 2**64-1 (pack.py
+            # VarIntType.write); pre-V36 IntType(128) allowed the historical
+            # % 2**128 mask.  The modulus must match the wire type's value
+            # domain: with the old mask, the moment the sharechain tip's
+            # cumulative work plus one share's attempts crosses 2**64,
+            # ref_type.pack raises 'int too large for varint' on every
+            # share-creation attempt and the node crash-loops deterministically
+            # (reboot reloads the same tip).  Wrapping at 2**64 is
+            # consensus-safe below the boundary (identical values) and must be
+            # applied identically here and in the other generate path.
+            abswork=((previous_share.abswork if previous_share is not None else 0) + bitcoin_data.target_to_average_attempts(bits.target)) % (2**64 if cls.VERSION >= 36 else 2**128),
         )
         if cls.VERSION < 34:
             share_info['new_transaction_hashes'] = new_transaction_hashes
@@ -1489,7 +1522,7 @@ class BaseShare(object):
             merged_coinbase_info=self.share_info.get('merged_coinbase_info', None))
 
         if other_tx_hashes2 != other_tx_hashes:
-            raise ValueError('reconstructed other_tx_hashes do not match expected')
+            raise DeterministicShareCheckFailure('reconstructed other_tx_hashes do not match expected')
         if bitcoin_data.get_txid(gentx) != self.gentx_hash:
             import sys
             packed = bitcoin_data.tx_id_type.pack(gentx)
@@ -1517,7 +1550,7 @@ class BaseShare(object):
             for i, txout in enumerate(gentx['tx_outs'][:6]):
                 print >>sys.stderr, '[GENTX-FAIL]  out[%d] value=%d script=%s' % (
                     i, txout['value'], txout['script'].encode('hex')[:60])
-            raise ValueError('''gentx doesn't match hash_link''')
+            raise DeterministicShareCheckFailure('''gentx doesn't match hash_link''')
         
         # V36+: Verify merged coinbase consensus enforcement.
         # Re-derive the canonical merged chain coinbase from PPLNS weights and
@@ -1529,7 +1562,13 @@ class BaseShare(object):
                 merged_info = self.share_info.get('merged_coinbase_info')
                 verify_merged_coinbase_commitment(self, tracker, self.net, parent_net)
             except ValueError as e:
-                raise ValueError('merged coinbase verification failed: %s' % (e,))
+                # Deterministic: re-derived from PPLNS weights over the saturated
+                # (immutable) ancestor window + this share's own committed params.
+                # The completeness gate inside verify_merged_coinbase_commitment
+                # (height < REAL_CHAIN_LENGTH -> early return, NOT raise) means any
+                # ValueError that reaches here is past the point where the check is
+                # deterministic, so the verdict is safe to negatively-cache.
+                raise DeterministicShareCheckFailure('merged coinbase verification failed: %s' % (e,))
         
         # V36+: Validate share-embedded messages (transition signals, etc.)
         #
@@ -1599,11 +1638,11 @@ class BaseShare(object):
 
         # share_info was already validated by generate_transaction matching gentx_hash
         if share_info != self.share_info:
-            raise ValueError('share_info invalid')
+            raise DeterministicShareCheckFailure('share_info invalid')
         
         if self.VERSION < 34:
             if bitcoin_data.calculate_merkle_link([None] + other_tx_hashes, 0) != self.merkle_link: # the other hash commitments are checked in the share_info assertion
-                raise ValueError('merkle_link and other_tx_hashes do not match')
+                raise DeterministicShareCheckFailure('merkle_link and other_tx_hashes do not match')
         
         update_min_protocol_version(counts, self)
 
@@ -2083,7 +2122,19 @@ class BaseShare(object):
                       ) if cls.VERSION < 32 else
                       max(desired_timestamp, (previous_share.timestamp + 1)) if previous_share is not None else desired_timestamp,
             absheight=((previous_share.absheight if previous_share is not None else 0) + 1) % 2**32,
-            abswork=((previous_share.abswork if previous_share is not None else 0) + bitcoin_data.target_to_average_attempts(bits.target)) % 2**128,
+            # abswork is a wrapping cumulative-work counter (same idiom as the
+            # absheight % 2**32 wrap above).  V36 serializes abswork as
+            # VarIntType, whose wire ceiling is 2**64-1 (pack.py
+            # VarIntType.write); pre-V36 IntType(128) allowed the historical
+            # % 2**128 mask.  The modulus must match the wire type's value
+            # domain: with the old mask, the moment the sharechain tip's
+            # cumulative work plus one share's attempts crosses 2**64,
+            # ref_type.pack raises 'int too large for varint' on every
+            # share-creation attempt and the node crash-loops deterministically
+            # (reboot reloads the same tip).  Wrapping at 2**64 is
+            # consensus-safe below the boundary (identical values) and must be
+            # applied identically here and in the other generate path.
+            abswork=((previous_share.abswork if previous_share is not None else 0) + bitcoin_data.target_to_average_attempts(bits.target)) % (2**64 if cls.VERSION >= 36 else 2**128),
         )
         if cls.VERSION < 34:
             share_info['new_transaction_hashes'] = template['new_transaction_hashes']
@@ -2611,6 +2662,36 @@ def get_decayed_cumulative_weights(tracker, start_hash, max_shares, desired_weig
 
     return weights, total_weight, donation_weight
 
+class _VerifyBudget(object):
+    '''Per-think() budget for EXPENSIVE share verifications (attempt_verify ->
+    Share.check()).  For V36 merged mining each check() is O(window) -- the
+    PPLNS decay walk (get_decayed_cumulative_weights) cannot use the skip list --
+    so verifying a freshly-adopted higher-work foreign chain of up to
+    CHAIN_LENGTH shares in ONE reactor callback is O(n^2) and blocks the reactor
+    for tens of seconds.  While blocked, p2p peers time out and drop, in-flight
+    share downloads abort, and clean_tracker purges the partially-synced chain --
+    the kr1z1s minority-fork adoption livelock.  This bounds the reactor time (or
+    count) spent verifying per think() call; think() runs on every handle_shares
+    batch plus a 5s LoopingCall, so already-verified / negative-cached shares are
+    O(1) skips and verification resumes on the next call -- progress stays
+    monotone and incremental without a long stall.'''
+    __slots__ = ['deadline', 'remaining', 'spent']
+    def __init__(self, time_budget, count_budget):
+        self.deadline = (time.time() + time_budget) if time_budget else None
+        self.remaining = count_budget  # None -> no count cap
+        self.spent = 0
+    def exhausted(self):
+        if self.remaining is not None and self.remaining <= 0:
+            return True
+        if self.deadline is not None and time.time() >= self.deadline:
+            return True
+        return False
+    def spend(self):
+        self.spent += 1
+        if self.remaining is not None:
+            self.remaining -= 1
+
+
 class OkayTracker(forest.Tracker):
     def __init__(self, net):
         forest.Tracker.__init__(self, delta_type=forest.get_attributedelta_type(dict(forest.AttributeDelta.attrs,
@@ -2624,7 +2705,33 @@ class OkayTracker(forest.Tracker):
         self.get_cumulative_weights = WeightsSkipList(self)
         self._merged_weights_skip_lists = {}  # chain_id -> MergedWeightsSkipList
         self._miner_merged_addr = {}  # chain_id -> {new_script: merged_script}
-    
+        # Bounded negative-verify cache: share.hash -> None for shares whose
+        # check() raised a DeterministicShareCheckFailure (a verdict that is a
+        # pure function of the share's own immutable content + its immutable
+        # ancestors, so it can never change on a re-check).  think() re-runs
+        # attempt_verify on every unverified head EVERY cycle (~1/s + on every
+        # share/block); for V36 merged mining check() rebuilds the canonical
+        # merged coinbase from PPLNS weights -- O(window) -- so a single stuck
+        # foreign/mis-versioned share would peg CPU by being re-verified forever.
+        # We record ONLY deterministic failures here; transient failures (missing
+        # parent, chain-not-long-enough, future timestamp) are never inserted, so
+        # they are retried normally once the missing data arrives.
+        self._negative_verify_cache = collections.OrderedDict()  # hash -> None, FIFO
+        self._negative_verify_cache_max = 10000
+        # --- v36 convergence fix: bounded synchronous verification budget ---
+        # think() verifies foreign shares synchronously; when a minority node
+        # adopts a higher-work chain it must verify up to CHAIN_LENGTH foreign
+        # shares, and each Share.check() is O(window).  Verifying them all in one
+        # think() callback blocks the reactor tens of seconds, dropping the very
+        # peers serving the majority chain and letting clean_tracker purge the
+        # partial download -> the node never converges.  We cap the reactor time
+        # spent verifying per think() (verify_time_budget seconds) and/or the
+        # number of expensive verifications (verify_count_budget); the next
+        # think() continues where this one stopped.  Both None -> unbounded
+        # (legacy behaviour).  Tests set a count budget for determinism.
+        self.verify_time_budget = 0.5   # seconds of reactor time per think()
+        self.verify_count_budget = None  # optional hard cap on check() calls
+
     @staticmethod
     def _normalize_script_for_merged(script):
         """Normalize parent chain script to merged chain form.
@@ -2684,15 +2791,51 @@ class OkayTracker(forest.Tracker):
             self._merged_weights_skip_lists[chain_id] = MergedWeightsSkipList(self, chain_id)
         return self._merged_weights_skip_lists[chain_id](start_hash, chain_length, max_weight)
 
+    def _negatively_cache_share(self, share_hash):
+        # Record a DETERMINISTIC check() failure so think()'s per-cycle
+        # re-verification never recomputes it. Bounded FIFO eviction.
+        cache = self._negative_verify_cache
+        if share_hash in cache:
+            return
+        cache[share_hash] = None
+        while len(cache) > self._negative_verify_cache_max:
+            cache.popitem(last=False)  # evict oldest
+
+    def _needs_verification(self, share_hash):
+        '''True iff attempt_verify(share_hash) would run the EXPENSIVE check()
+        path (i.e. the share is neither already verified nor negative-cached).
+        Used by think() to charge only real verifications against the budget --
+        cache hits stay free so incremental resume is O(1) per already-done
+        share.'''
+        return share_hash not in self.verified.items and share_hash not in self._negative_verify_cache
+
+    def _make_verify_budget(self):
+        return _VerifyBudget(self.verify_time_budget, self.verify_count_budget)
+
     def attempt_verify(self, share, block_abs_height_func, known_txs):
         if share.hash in self.verified.items:
             return True
+        if share.hash in self._negative_verify_cache:
+            # A previous cycle recorded a DETERMINISTIC check() rejection for this
+            # exact share (verdict is a pure function of its immutable content +
+            # immutable ancestors). Re-running check() -- which for V36 merged
+            # mining rebuilds the canonical merged coinbase from PPLNS weights at
+            # O(window) cost -- would only burn CPU to reach the same rejection.
+            return False
         height, last = self.get_height_and_last(share.hash)
         if height < self.net.CHAIN_LENGTH + 1 and last is not None:
             raise AssertionError()
         try:
             share.gentx = share.check(self, known_txs, block_abs_height_func=block_abs_height_func)
+        except DeterministicShareCheckFailure:
+            # Rejection that can NEVER change on a re-check -> negatively cache it.
+            log.err(None, 'Share check failed (deterministic, negative-cached): %064x -> %064x' % (share.hash, share.previous_hash if share.previous_hash is not None else 0))
+            self._negatively_cache_share(share.hash)
+            return False
         except:
+            # TRANSIENT failure (missing parent, chain-not-long-enough, future
+            # timestamp, incomplete height, ...). NOT cached -- it may succeed
+            # once the missing data arrives, so it must be retried next cycle.
             log.err(None, 'Share check failed: %064x -> %064x' % (share.hash, share.previous_hash if share.previous_hash is not None else 0))
             return False
         else:
@@ -2703,6 +2846,18 @@ class OkayTracker(forest.Tracker):
         desired = set()
         bad_peer_addresses = set()
         
+        # Bound the reactor time spent verifying foreign shares this cycle so a
+        # deep minority-fork adoption cannot block the reactor (which would drop
+        # the peers serving the majority chain and let clean_tracker purge the
+        # partial download). Both loops below share this one budget; when it is
+        # exhausted we stop verifying and return normally -- the next think()
+        # (every handle_shares batch + 5s LoopingCall) resumes, skipping the
+        # already-verified shares in O(1). Verification thus proceeds
+        # incrementally at full throughput without a long stall, and the EXISTING
+        # best-tail/best-head selection adopts the foreign chain the moment its
+        # verified height crosses the thresholds.
+        verify_budget = self._make_verify_budget()
+
         # O(len(self.heads))
         #   make 'unverified heads' set?
         # for each overall head, attempt verification
@@ -2711,8 +2866,12 @@ class OkayTracker(forest.Tracker):
         bads = []
         for head in set(self.heads) - set(self.verified.heads):
             head_height, last = self.get_height_and_last(head)
-            
+
             for share in self.get_chain(head, head_height if last is None else min(5, max(0, head_height - self.net.CHAIN_LENGTH))):
+                if self._needs_verification(share.hash):
+                    if verify_budget.exhausted():
+                        break  # resume this head on a later think() -- no desired add, no bad mark
+                    verify_budget.spend()
                 if self.attempt_verify(share, block_abs_height_func, known_txs):
                     break
                 bads.append(share.hash)
@@ -2748,6 +2907,10 @@ class OkayTracker(forest.Tracker):
             get = min(want, can)
             #print 'Z', head_height, last_hash is None, last_height, last_last_hash is None, want, can, get
             for share in self.get_chain(last_hash, get):
+                if self._needs_verification(share.hash):
+                    if verify_budget.exhausted():
+                        break  # resume this head's catch-up on a later think()
+                    verify_budget.spend()
                 if not self.attempt_verify(share, block_abs_height_func, known_txs):
                     break
             if head_height < self.net.CHAIN_LENGTH and last_last_hash is not None:

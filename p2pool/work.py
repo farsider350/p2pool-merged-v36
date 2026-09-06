@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 from __future__ import division
 from collections import deque
 
@@ -18,6 +19,7 @@ from p2pool import fillbudget
 from p2pool.util import coopevent
 import p2pool, p2pool.data as p2pool_data
 from p2pool import merged_mining
+from p2pool.override_governor import OverrideGovernor
 
 # Import merged chain networks for address conversion
 # These are used when converting pubkey_hash from share chain to merged chain addresses
@@ -188,6 +190,12 @@ class WorkerBridge(worker_interface.WorkerBridge):
         self.my_pubkey_hash = my_pubkey_hash
         self.my_pubkey_type = my_pubkey_type  # V36: 0=P2PKH, 1=P2WPKH/bech32, 2=P2SH
 		
+        # Canonical serve-gate opt-out for intentional solo/bootstrap mining.
+        # When True, the PERSIST=True refuse-work guards below are bypassed --
+        # the dynamic equivalent of setting PERSIST=False in the network file,
+        # applied only to the two upstream stratum/getwork guard sites.
+        self.allow_peerless_mining = bool(getattr(args, 'solo', False))
+
         self.donation_percentage = args.donation_percentage
         self.node_owner_fee = getattr(args, 'node_owner_fee', worker_fee)
         self.worker_fee = self.node_owner_fee
@@ -288,6 +296,32 @@ class WorkerBridge(worker_interface.WorkerBridge):
         # Poll detector independently of miner get_work() traffic.
         self._whale_poll_task = task.LoopingCall(self._whale_poll_tick)
         self._whale_poll_task.start(self._whale_sample_interval, now=False)
+
+        # Generalized override governor: whale-departure ENTRY is decided by the
+        # detector below, but EXIT is delegated to the governor, which reads ONLY
+        # own-production counters + wall-clock -- signals the easy-target override
+        # cannot itself degrade. This structurally dissolves the self-suppressing
+        # latch (the removed ratio>=0.75 exit read chain-surviving hashrate, which
+        # the override itself distorts). Whale passes recovery_fn=None: legitimate
+        # whale-mode is preserved by running to the duration backstop, not curtailed
+        # by an own-hr recovery arm.
+        def _own_hr():
+            mh, dh = self.get_local_rates()                 # 2-tuple, verified work.py:2005
+            return sum(mh.itervalues()) + sum(dh.itervalues())
+        # Refused stale-tip siblings (mandate-3 refusal below) are dead own work
+        # that is NEVER minted -- so without them the orphan circuit-breaker's
+        # own_mint delta can stay below MIN_OWN_DELTA forever and the breaker is
+        # STARVED (it can never warm up), letting the easy-target override latch
+        # while producing majority-dead work. Count each refused sibling as one
+        # unit of own production AND one unit of not-in-chain production, so a
+        # refusal storm warms the window and trips the breaker within ~T_ORPHAN.
+        self._whale_refused_siblings = 0
+        self._override_gov = OverrideGovernor(
+            own_hr_fn       = _own_hr,
+            own_mint_fn     = lambda: self.get_stale_counts()[1] + self._whale_refused_siblings,
+            own_notchain_fn = lambda: sum(self.get_stale_counts()[0]) + self._whale_refused_siblings,
+        )
+        self._whale_last_exit_reason = None
 
         self.removed_unstales_var = variable.Variable((0, 0, 0))
         self.removed_doa_unstales_var = variable.Variable(0)
@@ -617,13 +651,14 @@ class WorkerBridge(worker_interface.WorkerBridge):
                                                     skipped_addresses.append((key.encode('hex')[:20] + '...', 'unconvertible script type'))
                                                     continue
 
-                                                # Node operator override for raw script keys
-                                                # Compare pubkey_hash directly — self.args.address may be None
-                                                # when address was auto-detected from bitcoind
-                                                if self.my_pubkey_hash is not None and pubkey_hash == self.my_pubkey_hash and self.merged_operator_address:
-                                                    override_addr = self._get_validated_merged_operator_address(merged_addr_net, chainid)
-                                                    if override_addr is not None:
-                                                        merged_address = override_addr
+                                                # NOTE: no served-only operator override here. The operator's
+                                                # merged (DOGE) commission is resolved and COMMITTED into the
+                                                # share at creation time (get_user_details ->
+                                                # _resolve_operator_merged_addresses), so this served coinbase,
+                                                # the canonical verifier (build_canonical_merged_coinbase), and
+                                                # the payout hash all read the SAME committed merged_addresses.
+                                                # A redirect here would be served-only and diverge from the
+                                                # committed distribution -> rejected on any multi-node pool.
                                             elif key_is_address:
                                                 # VERSION >= 34: key is already a parent chain address string
                                                 # Need to convert to merged chain address
@@ -645,23 +680,13 @@ class WorkerBridge(worker_interface.WorkerBridge):
                                                     skipped_addresses.append((parent_address[:20] + '...', error_msg))
                                                     continue
 
-                                                # Node operator override: if --merged-operator-address is set,
-                                                # use it for the operator's own share of merged chain payout
-                                                # instead of auto-converting from parent chain address.
-                                                is_own_address = (self.args.address is not None and parent_address == self.args.address) or \
-                                                    (self.my_pubkey_hash is not None and pubkey_hash is not None and pubkey_hash == self.my_pubkey_hash)
-                                                if is_own_address and self.merged_operator_address:
-                                                    override_addr = self._get_validated_merged_operator_address(merged_addr_net, chainid)
-                                                    if override_addr is not None:
-                                                        merged_address = override_addr
-                                                    else:
-                                                        # Validation failed — fall through to normal auto-conversion
-                                                        if addr_type == 'p2sh':
-                                                            merged_address = bitcoin_data.pubkey_hash_to_address(pubkey_hash, merged_addr_net.ADDRESS_P2SH_VERSION, -1, merged_addr_net)
-                                                        else:
-                                                            merged_address = bitcoin_data.pubkey_hash_to_address(pubkey_hash, merged_addr_net.ADDRESS_VERSION, -1, merged_addr_net)
-                                                # Standard auto-conversion from parent chain address
-                                                elif addr_type == 'p2sh':
+                                                # NOTE: no served-only operator override here either. The
+                                                # operator's merged commission is committed into the share at
+                                                # creation (get_user_details -> _resolve_operator_merged_addresses);
+                                                # overriding only the served coinbase would diverge from
+                                                # build_canonical_merged_coinbase() (the peer verifier) and fork.
+                                                # Standard auto-conversion from parent chain address.
+                                                if addr_type == 'p2sh':
                                                     merged_address = bitcoin_data.pubkey_hash_to_address(pubkey_hash, merged_addr_net.ADDRESS_P2SH_VERSION, -1, merged_addr_net)
                                                 else:
                                                     merged_address = bitcoin_data.pubkey_hash_to_address(pubkey_hash, merged_addr_net.ADDRESS_VERSION, -1, merged_addr_net)
@@ -1298,6 +1323,130 @@ class WorkerBridge(worker_interface.WorkerBridge):
             self._merged_op_addr_cache[cache_key] = ''  # Cache the negative result
             return None
 
+    def _resolve_operator_merged_addresses(self, chainid=98):
+        """Resolve the node operator's merged (DOGE) payout for a share that the
+        -f/--fee draw has reassigned to the operator's OWN key.
+
+        LTC-parity, never-empty cascade (mirrors the parent-chain rule that the
+        operator destination is always resolvable, plus miner Tier-1/2/3):
+
+          P1. --merged-operator-address set AND valid on the merged net
+              -> commit its script (address->hash->script2, P2SH-aware).
+          P2. unset OR invalid OR script build throws
+              -> auto-convert the operator's own parent key (my_pubkey_hash),
+                 hash-preserving, exactly like miner Tier-2
+                 (_auto_generate_merged_addresses). This is what [CHECK 3]
+                 promised at startup, so the boot banner and the committed
+                 share agree.
+          P3. operator key type unconvertible (never for P2PKH/P2SH/P2WPKH)
+              -> commit the FIXED pool DONATION script (COMBINED_DONATION_SCRIPT).
+                 This is the FINAL never-empty fallback: rather than returning an
+                 empty merged_addresses (which would drop the operator merged
+                 commission to pool distribution AND is the only remaining
+                 empty-commit path), the operator merged commission is routed to
+                 the pool donation address. The donation script is a compile-time
+                 pool constant (identical on every node), so this NEVER yields an
+                 empty entry. No path returns None any more -> empty-commit for an
+                 operator/fallback share is eliminated by construction.
+
+        The result is COMMITTED into share_info['merged_addresses'] upstream, so
+        the served coinbase, build_canonical_merged_coinbase() (peer verifier)
+        and compute_merged_payout_hash() all read the identical bytes -> the
+        redirect is consensus-safe on every node. Cached once (hot per-request
+        path); my_pubkey_hash / merged_operator_address are process-fixed.
+        Always returns a fresh non-empty dict (P1/P2/P3-donation), never None.
+        """
+        if getattr(self, '_operator_merged_cache_set', False):
+            cached = self._operator_merged_cache
+            return dict(cached) if cached is not None else None
+
+        merged_net = self._get_merged_address_net(chainid)
+        result = None
+
+        # ---- P1: explicit --merged-operator-address, valid on the merged net ----
+        if merged_net is not None and self.merged_operator_address:
+            override_addr = self._get_validated_merged_operator_address(merged_net, chainid)
+            if override_addr is not None:
+                try:
+                    op_pubkey_hash, op_version, op_witver = bitcoin_data.address_to_pubkey_hash(
+                        override_addr, merged_net)
+                    script = bitcoin_data.pubkey_hash_to_script2(
+                        op_pubkey_hash, op_version, op_witver, merged_net)
+                    result = {
+                        'dogecoin': override_addr,
+                        '_validated': [{'chain_id': chainid, 'script': script}],
+                        '_operator_stamped': True,
+                    }
+                except Exception as e:
+                    # Explicit but script build failed -> fall to P2 (never empty).
+                    print >>sys.stderr, '[MERGED] Operator override %s failed script build (%s) - falling back to auto-conversion of operator parent key' % (
+                        override_addr, e)
+                    result = None
+
+        # ---- P2: auto-convert the operator's own parent key (Tier-2 mirror) ----
+        if result is None and self.my_pubkey_hash is not None:
+            op_addr_type = 'p2sh' if self.my_pubkey_type == p2pool_data.PUBKEY_TYPE_P2SH else 'p2pkh'
+            auto_entries = self._auto_generate_merged_addresses(self.my_pubkey_hash, op_addr_type)
+            if auto_entries:
+                result = {'_validated': auto_entries, '_operator_stamped': True, '_auto_converted': True}
+                for ae in auto_entries:
+                    try:
+                        ae_net = self._get_merged_address_net(ae['chain_id'])
+                        ae_chain = self._get_merged_chain_name(ae['chain_id'])
+                        if op_addr_type == 'p2sh':
+                            ae_addr = bitcoin_data.pubkey_hash_to_address(
+                                self.my_pubkey_hash, ae_net.ADDRESS_P2SH_VERSION, -1, ae_net)
+                        else:
+                            ae_addr = bitcoin_data.pubkey_hash_to_address(
+                                self.my_pubkey_hash, ae_net.ADDRESS_VERSION, -1, ae_net)
+                        result[ae_chain] = ae_addr
+                    except Exception:
+                        pass
+
+        # ---- P3: unconvertible operator key -> FIXED pool DONATION script ----
+        # Final never-empty fallback. Instead of an empty merged_addresses (which
+        # would drop the operator merged commission to pool distribution and is
+        # the ONLY remaining empty-commit path), commit the fixed pool donation
+        # script. COMBINED_DONATION_SCRIPT is a compile-time pool constant, so
+        # every node commits/verifies the identical bytes (consensus-safe).
+        if result is None:
+            result = self._donation_merged_addresses(chainid)
+            print >>sys.stderr, '[MERGED] Operator merged (DOGE) address unresolvable (parent key type %r not convertible) - routing operator merged commission to the pool DONATION script (never-empty by construction)' % (
+                getattr(self, 'my_pubkey_type', None),)
+
+        self._operator_merged_cache = result
+        self._operator_merged_cache_set = True
+        return dict(result) if result is not None else None
+
+    def _donation_merged_addresses(self, chainid=98):
+        """Build a merged_addresses dict paying the FIXED pool DONATION script.
+
+        COMBINED_DONATION_SCRIPT (p2pool.data / p2pool.merged_mining) is a
+        compile-time pool constant -- the same P2SH scriptPubKey already used as
+        the coinbase donation/marker output in build_canonical_merged_coinbase().
+        It is NOT per-node state and NOT a CLI flag, so committing it is
+        consensus-safe: build_canonical_merged_coinbase() and every peer verifier
+        read the identical bytes byte-for-byte. Used as the terminal never-empty
+        fallback so no operator/fallback share ever commits an empty
+        merged_addresses. Returns a fresh dict.
+        """
+        from p2pool.data import COMBINED_DONATION_SCRIPT
+        result = {
+            '_validated': [{'chain_id': chainid, 'script': COMBINED_DONATION_SCRIPT}],
+            '_operator_stamped': True,
+            '_donation_fallback': True,
+        }
+        # Cosmetic display address (consensus depends only on 'script').
+        try:
+            merged_net = self._get_merged_address_net(chainid)
+            chain_name = self._get_merged_chain_name(chainid)
+            if merged_net is not None:
+                result[chain_name] = bitcoin_data.script2_to_address(
+                    COMBINED_DONATION_SCRIPT, merged_net.ADDRESS_P2SH_VERSION, -1, merged_net)
+        except Exception:
+            pass
+        return result
+
     def _get_pplns_entries(self):
         """Get cached PPLNS weight entries.
 
@@ -1510,7 +1659,10 @@ class WorkerBridge(worker_interface.WorkerBridge):
         #   4. If invalid: log warning, omit from merged_addresses (auto-conversion fallback)
         merged_addresses = {}
         worker = ''
-        
+        # Set when the -f/--fee probabilistic draw reassigns this whole share to
+        # the operator's own key. Drives the operator merged (DOGE) stamp below.
+        operator_fee_draw = False
+
         if ',' in user:
             # Split merged addresses
             # Format: ltc_addr,doge_addr[.worker] or ltc_addr,doge_addr[_worker]
@@ -1632,6 +1784,7 @@ class WorkerBridge(worker_interface.WorkerBridge):
         if random.uniform(0, 100) < self.node_owner_fee:
             pubkey_hash = self.my_pubkey_hash
             pubkey_type = self.my_pubkey_type
+            operator_fee_draw = True  # whole share reassigned to operator's key
         # Resolve miner address to pubkey_hash for share creation.
         # V36 uses COMBINED_DONATION_SCRIPT (1-of-2 P2MS) in coinbase for donations.
         # No fake miner mechanism needed — donation is handled entirely in coinbase.
@@ -1867,6 +2020,69 @@ class WorkerBridge(worker_interface.WorkerBridge):
                         print >>sys.stderr, '[POOL] Invalid miner address %s from %s - redistributed (%s mode)' % (
                             user[:30] + ('...' if len(user) > 30 else '') if user else '(empty)', peer_addr or 'unknown', getattr(self.args, 'redistribute_mode', 'pplns'))
         
+        # ===============================================================
+        # Merged (DOGE) leg resolution -- LTC-parity, NEVER empty.
+        # This single guard sits upstream of the commit seam
+        # (preprocess_request -> _current_merged_addresses ->
+        # share_info['merged_addresses']), so whatever it stamps is what
+        # every peer verifies. Two cases:
+        # ===============================================================
+        if operator_fee_draw:
+            # The -f/--fee draw reassigned this whole share to the operator's
+            # own key. REPLACE the requesting miner's merged addresses with the
+            # operator's resolved merged (DOGE) payout -- never leak a foreign
+            # miner's DOGE script onto an operator-keyed share (this is the L2
+            # leak the old code left open by SKIPPING address resolution on a
+            # winning roll). Consensus-safe: the resolved script is committed.
+            operator_merged = self._resolve_operator_merged_addresses(98)
+            if operator_merged is not None:
+                merged_addresses = operator_merged
+            else:
+                # Defensive: _resolve_operator_merged_addresses now NEVER returns
+                # None (P3 routes to the fixed pool donation script). If that ever
+                # regresses, still never commit {} -- fall to the donation script,
+                # not a foreign miner's leg.
+                merged_addresses = self._donation_merged_addresses(98)
+        elif not (merged_addresses and merged_addresses.get('_validated')) and pubkey_hash is not None:
+            # Universal never-empty floor. Any share whose merged leg is still
+            # unresolved at return time -- notably the _redistribute_share
+            # landings (fee mode, empty-window PPLNS fallback, Case 3) -- gets
+            # its merged (DOGE) leg auto-converted from the pubkey_hash the share
+            # actually pays, hash-preserving (same owner on both chains).
+            if pubkey_hash == self.my_pubkey_hash:
+                # Redistribution (notably --redistribute fee, but also an
+                # empty-window PPLNS fallback) landed on the operator's OWN key.
+                # Honor the explicit --merged-operator-address through the full
+                # P1->P2->P3 cascade instead of a raw hash-convert of the parent
+                # key. Without this, an operator running --redistribute fee WITH a
+                # distinct --merged-operator-address (separate DOGE wallet) would
+                # have their collected DOGE commission silently paid to
+                # convert(my_pubkey_hash) rather than the configured address --
+                # the -f/--fee draw path above already resolves via P1; this
+                # closes the same leak on the collection (redistribute) path.
+                operator_merged = self._resolve_operator_merged_addresses(98)
+                if operator_merged is not None:
+                    merged_addresses = operator_merged
+            else:
+                # Non-operator landing (a specific miner picked by pplns/boost):
+                # convert whatever pubkey_hash the share actually pays.
+                floor_addr_type = 'p2sh' if pubkey_type == p2pool_data.PUBKEY_TYPE_P2SH else 'p2pkh'
+                floor_entries = self._auto_generate_merged_addresses(pubkey_hash, floor_addr_type)
+                if floor_entries:
+                    merged_addresses['_validated'] = floor_entries
+                    merged_addresses['_auto_converted'] = True
+
+        # Terminal never-empty backstop (by construction). If, after the whole
+        # cascade above, the merged (DOGE) leg is STILL unresolved -- notably the
+        # pubkey_hash-is-None edge that the elif skips (a share that pays no one on
+        # the parent chain), or a floor auto-convert that produced no entry --
+        # commit the FIXED pool donation script rather than an empty
+        # merged_addresses. This closes the last empty-commit path; the donation
+        # script is a node-invariant pool constant so every peer verifies the same
+        # bytes. No operator/fallback share can ever commit {} from here on.
+        if not (merged_addresses and merged_addresses.get('_validated')):
+            merged_addresses = self._donation_merged_addresses(98)
+
         # Append worker name to user for identification
         if worker:
             user = user + '.' + worker
@@ -1875,10 +2091,103 @@ class WorkerBridge(worker_interface.WorkerBridge):
         #print '[DEBUG] get_user_details returning: user=%r, merged_addresses=%r' % (user, merged_addresses)
         return user, pubkey_hash, pubkey_type, desired_share_target, desired_pseudoshare_target, merged_addresses
 
+    def _persist_serve_gate_active(self):
+        # Canonical p2pool refuses to serve work on a PERSIST=True network while
+        # it cannot know the true sharechain head (no p2pool peers) -- any work it
+        # would hand out builds on the persisted OLD head and orphans once think()
+        # adopts the real network head. The --solo/--bootstrap flag (allow_peerless_mining)
+        # is the dynamic equivalent of PERSIST=False and opts out of the gate.
+        return self.node.net.PERSIST and not self.allow_peerless_mining
+
+    def _peerless(self):
+        return self.node.p2p_node is None or len(self.node.p2p_node.peers) == 0
+
+    # Cap on how far the served sharechain tip may lag wall-clock before the
+    # #19 serve-gate refuses work. 600s = 40*SHARE_PERIOD(15s) on litecoin --
+    # well past the emergency-decay threshold (20*SHARE_PERIOD=300s, data.py)
+    # and the whale gap trigger (8*SHARE_PERIOD=120s), so a healthy pool never
+    # reaches it; only a genuinely stalled/partitioned tip does.
+    _serve_stale_tip_max_age = 600.0
+
+    def _tip_is_stale(self):
+        '''True iff the best share's miner-set timestamp lags wall-clock by more
+        than _serve_stale_tip_max_age. Node-local serving policy only: while the
+        served tip is this stale, the emergency time-based difficulty decay
+        (data.py:840-854) would ease the served target without bound, computing
+        drastically-too-easy work off a dead tip -- the diff-corruption flood
+        source. Refusing to serve caps the served easing (~4x at 600s) and makes
+        the flood unservable, WITHOUT touching the consensus decay formula (share
+        verification stays byte-identical network-wide). Self-clears the instant
+        the tip advances, since the timestamp is read live each call. Any read
+        failure (missing tracker item) -> not stale (never a false refusal).'''
+        best = self.node.best_share_var.value
+        if best is None:
+            return False
+        try:
+            ts = self.node.tracker.items[best].timestamp
+        except Exception:
+            return False
+        return (time.time() - ts) > self._serve_stale_tip_max_age
+
+    # --- v36-0.24: the stale-tip serve-HOLD and its escapes are REMOVED --------
+    # HISTORY. v36-0.20 (#21) refused ALL get_work while the served tip was dead
+    # >600s, to stop the v36-only emergency time-decay from minting flood-diff
+    # work off a dead tip. v36-0.21 (#22, da77f64) found that refusal deadlocks a
+    # majority node (refusing the only tip-advancing hashrate -> the tip can never
+    # advance -> the hold never clears -> miners starve; kr1z1s 2026-08-30) and so
+    # made the hold ESCAPABLE via a "majority-escape" that served work again when
+    # _local_pool_fraction() >= 0.5. v0.22 (#24, F4) then had to widen that
+    # fraction's denominator because a minority-fork node with local miners always
+    # measured >= 0.5 and self-escaped onto its own fork.
+    #
+    # WHY IT IS GONE. Any mechanism where a node's OWN local state decides "I am
+    # the majority, so I may resume minting on this (possibly minority) tip" is a
+    # fork-birth / self-desync door -- exactly the attack class this fix closes: a
+    # node on a minority tip must never be able to declare itself the majority and
+    # self-sustain a fork while a longer live chain is reachable. v35 (jtoomim)
+    # had NO such hold, NO escapes, and NO emergency decay, and converged
+    # flawlessly with the identical chain-selection code (grep confirms 0
+    # occurrences of any of these symbols in v35 work.py). The flood the v0.20
+    # hold was invented to stop is contained CONSENSUS-SAFELY, without ever
+    # refusing work, by _clamp_stale_tip_serve_target below (it only HARDENS the
+    # served target; share verification network-wide is byte-identical). So we
+    # restore v35's serve-always behaviour and keep only the serve-side clamp.
+    _stale_tip_serve_max_easing = 4       # served target capped at 4x the tip's own target
+
+    def _clamp_stale_tip_serve_target(self, desired_share_target, previous_share):
+        '''Serve-side easing cap (v36-0.21, retained) -- the consensus-safe
+        replacement for the emergency-decay clamp, and now (v36-0.24) the SOLE
+        containment for the stale-tip flood after the serve-hold + escapes were
+        removed. While the tip is stale, cap the SERVED target at
+        _stale_tip_serve_max_easing x the tip share's own target, so a node still
+        serving work off a dead tip (we no longer refuse it) can never MINT
+        flood-diff work off that tip.
+
+        Consensus-safe: this only ever HARDENS the served share (min() picks the
+        smaller = harder target). A share can always be mined harder than the
+        consensus floor, so verification is unaffected. Critically, the emergency
+        time-decay formula in data.py generate_transaction() -- which runs inside
+        Share.check() during network-wide share VERIFICATION -- is left byte-for-
+        byte untouched, so this node neither rejects the network's shares nor
+        mints shares the network would reject. No-op when the tip is fresh or the
+        tip target is unreadable.'''
+        if previous_share is None or not self._tip_is_stale():
+            return desired_share_target
+        try:
+            cap = previous_share.target * self._stale_tip_serve_max_easing
+            return min(desired_share_target, cap)
+        except Exception:
+            return desired_share_target
+
     def preprocess_request(self, user, peer_addr=None):
         # Debug: Uncomment to trace preprocess flow
         #print '[DEBUG] preprocess_request called with user:', repr(user)
-        # Removed peer connection check - allow solo mining
+        # Canonical guard (jtoomim p2pool work.py preprocess_request): refuse work
+        # when we have no p2pool peers on a PERSIST=True network. Stratum's
+        # _send_work turns the raise into loseConnection, so rigs retry-poll until
+        # a peer is up -- the canonical "hold until connected" with no stale-head work.
+        if self._peerless() and self._persist_serve_gate_active():
+            raise jsonrpc.Error_for_code(-12345)(u'p2pool is not connected to any peers')
         if time.time() > self.current_work.value['last_update'] + 60:
             raise jsonrpc.Error_for_code(-12345)(u'lost contact with coind')
         username, pubkey_hash, pubkey_type, desired_share_target, desired_pseudoshare_target, merged_addresses = self.get_user_details(user, peer_addr=peer_addr)
@@ -1896,6 +2205,12 @@ class WorkerBridge(worker_interface.WorkerBridge):
 
     def _whale_poll_tick(self):
         # Keep detector active even if no local miners are requesting work.
+        # Sample own-production every tick (always), then advance the state machine.
+        try:
+            self._override_gov.sample()
+        except Exception:
+            if p2pool.DEBUG:
+                log.err(None, 'whale governor sample failed:')
         try:
             self._detect_whale_departure(trigger_source='timer')
         except Exception:
@@ -1979,28 +2294,75 @@ class WorkerBridge(worker_interface.WorkerBridge):
             source=trigger_source,
         )
 
+        # EXIT is now delegated entirely to the OverrideGovernor. Its exits read
+        # ONLY own-production counters + wall-clock -- signals the easy-target
+        # override cannot itself degrade -- so the self-suppressing latch is
+        # structurally impossible. The old ratio>=0.75 recovery arm (which read
+        # the distorted chain-surviving-hashrate signal) has been REMOVED.
+        # att_s/ratio remain computed above for ENTRY only.
         if self._whale_departure_active:
-            # Recovery: require sustained improvement to exit emergency mode
-            if ratio >= self._whale_recovery_threshold:
+            # Governor tick: True == still active, False == time to exit.
+            if not self._override_gov.tick('whale'):
                 self._whale_departure_active = False
                 self._whale_baseline_hr = 0
-                duration = now - self._whale_departure_ts
-                print '[WHALE-RECOVERY] OFF src=%s ratio=%.2f gap=%.0fs duration=%.0fs current=%sH/s baseline=%sH/s' % (
-                    trigger_source, ratio, share_gap, duration, _fmt_hr(att_s), _fmt_hr(baseline_hr))
+                st = self._override_gov.status().get('whale', {})
+                self._whale_last_exit_reason = st.get('exit_reason')
+                print '[WHALE-RECOVERY] OFF reason=%s dur=%.0fs own_orphan=%s baseline=%sH/s' % (
+                    st.get('exit_reason'), st.get('seconds', 0), st.get('own_orphan_rate'), _fmt_hr(baseline_hr))
             elif now - self._whale_log_interval > 30:
                 self._whale_log_interval = now
-                print '[WHALE-DEPARTURE] ACTIVE src=%s current=%sH/s baseline=%sH/s avg_30m=%sH/s ratio=%.2f gap=%.0fs recover>%.0f%%' % (
-                    trigger_source, _fmt_hr(att_s), _fmt_hr(baseline_hr), _fmt_hr(avg_hr), ratio, share_gap, self._whale_recovery_threshold * 100)
+                st = self._override_gov.status().get('whale', {})
+                print '[WHALE-DEPARTURE] ACTIVE src=%s current=%sH/s baseline=%sH/s avg_30m=%sH/s ratio=%.2f gap=%.0fs gov_dur=%.0fs own_orphan=%s' % (
+                    trigger_source, _fmt_hr(att_s), _fmt_hr(baseline_hr), _fmt_hr(avg_hr), ratio, share_gap,
+                    st.get('seconds', 0), st.get('own_orphan_rate'))
         else:
-            # Detection: trigger when hashrate drops below threshold
+            # Detection/ENTRY: unchanged trigger expression. The governor's arm()
+            # respects a re-arm cooldown after an orphan-forced exit, so a re-trip
+            # during cooldown leaves _whale_departure_active False (override off).
             if (enough_samples and ratio <= self._whale_drop_threshold) or (gap_trigger and ratio <= 0.90):
-                self._whale_departure_active = True
-                self._whale_departure_ts = now
-                self._whale_baseline_hr = baseline_hr
-                print '[WHALE-DEPARTURE] DETECTED src=%s ratio=%.2f gap=%.0fs current=%sH/s baseline=%sH/s avg_30m=%sH/s' % (
-                    trigger_source, ratio, share_gap, _fmt_hr(att_s), _fmt_hr(baseline_hr), _fmt_hr(avg_hr))
+                if self._override_gov.arm('whale', recovery_fn=None):
+                    self._whale_departure_active = True
+                    self._whale_departure_ts = now
+                    self._whale_baseline_hr = baseline_hr
+                    print '[WHALE-DEPARTURE] DETECTED src=%s ratio=%.2f gap=%.0fs current=%sH/s baseline=%sH/s avg_30m=%sH/s' % (
+                        trigger_source, ratio, share_gap, _fmt_hr(att_s), _fmt_hr(baseline_hr), _fmt_hr(avg_hr))
 
         return self._whale_departure_active
+
+    def _override_dead_majority(self):
+        '''Self-healing invariant for the easy-target override. Returns True when
+        our OWN windowed dead/refused fraction is at or above the governor's
+        ORPHAN_CEILING -- i.e. the easy-target mode is currently producing a
+        majority of dead/orphan work. In that state the override is net-harmful
+        (it is the flood source), so it must NOT be applied: a ~100%-DOA state
+        structurally disables the override that causes it, and the mode re-enables
+        only once own production is healthy again. Reuses the governor's own
+        windowed-orphan estimate (own-production + wall-clock only -- a signal the
+        easy-target override cannot itself distort). Warm-up (rate is None) does
+        NOT disable the override.'''
+        try:
+            rate, _ = self._override_gov._windowed_orphan()
+        except Exception:
+            return False
+        return rate is not None and rate >= self._override_gov.ORPHAN_CEILING
+
+    def _share_job_lags_tip(self, job_prev):
+        '''Fork-safe: True iff the job's parent (job_prev) lags the current best
+        share by MORE than one (i.e. best has already been extended past a normal
+        one-step drift). Used ONLY in easy-target (whale-override) mode to refuse
+        minting a sibling of an already-extended tip -- the orphan-flood source.
+        Lag 0 (job_prev == best) and lag 1 (job_prev == parent of best, normal
+        drift) both return False. Unknown/divergent -> never refuse (returns per
+        the walk below; an exception is treated as "do not refuse").'''
+        best = self.node.best_share_var.value
+        if job_prev is None or best is None or job_prev == best:      # lag 0
+            return False
+        try:
+            if self.node.tracker.get_nth_parent_hash(best, 1) == job_prev:   # lag 1 (normal drift)
+                return False
+        except Exception:
+            return False                                             # unknown -> never refuse
+        return True                                                  # lag > 1 or divergent fork
 
     def get_local_rates(self):
         miner_hash_rates = {}
@@ -2545,9 +2907,32 @@ class WorkerBridge(worker_interface.WorkerBridge):
         if merged_addresses is None:
             merged_addresses = {}
         self._current_merged_addresses = merged_addresses
-        
-        # Removed peer connection check - allow solo mining
-        # P2Pool can work standalone even with PERSIST=True
+
+        # Canonical guards (jtoomim p2pool work.py get_work): on a PERSIST=True
+        # network, refuse work while (a) no p2pool peers are connected, or (b) the
+        # tracker has no best share yet -- in both cases we cannot know the true
+        # head and would serve stale-head work off the persisted OLD chain, which
+        # orphans (the restart-DOA spike). This also neutralizes the V36 secondary
+        # amplifiers: the emergency time-based difficulty decay (data.py) and the
+        # whale-departure override both key off the persisted head's stale
+        # timestamp, so by not building work off that head until convergence, no
+        # drastically-too-easy work is ever computed from it. --solo/--bootstrap
+        # (allow_peerless_mining) opts out for intentional solo/new-chain mining.
+        if self._persist_serve_gate_active():
+            if self._peerless():
+                raise jsonrpc.Error_for_code(-12345)(u'p2pool is not connected to any peers')
+            if self.node.best_share_var.value is None:
+                raise jsonrpc.Error_for_code(-12345)(u'p2pool is downloading shares')
+            # v36-0.24: the stale-tip serve-HOLD (v0.20 refusal + v0.21/0.22
+            # majority/duration escapes) is REMOVED -- it was a self-desync door
+            # (a node's own local state deciding "I am the majority" resumed
+            # minting on its own possibly-minority tip) and v35 converged flawlessly
+            # with no such hold. We keep only the two canonical jtoomim guards above
+            # (peerless / no-best-share). The emergency-decay flood the hold was
+            # invented to stop is now contained on the serve side, without ever
+            # refusing work, by _clamp_stale_tip_serve_target (below): it only
+            # HARDENS the served target, so share verification stays byte-identical
+            # network-wide and a majority node is never starved of work.
 
         # Build user-specific merged templates so finder fee can target the work recipient.
         effective_merged_work = self._build_user_specific_merged_work(user, merged_addresses, share_pubkey_hash=pubkey_hash, share_pubkey_type=pubkey_type)
@@ -2651,18 +3036,45 @@ class WorkerBridge(worker_interface.WorkerBridge):
         # accelerating the difficulty recovery from ~18 min to much less.
         # This is non-consensus: bits stays within [pre_target3//30, pre_target3].
         local_hash_rate_for_guard = local_addr_rates.get(pubkey_hash, 0)
-        if self._detect_whale_departure():
-            if local_hash_rate_for_guard >= self._whale_min_local_hashrate:
-                desired_share_target = 2**256 - 1  # will be clamped to pre_target3 (easiest)
-            elif time.time() - self._whale_last_no_local_log > 30:
-                self._whale_last_no_local_log = time.time()
-                metrics = self._whale_last_metrics or {}
+        # Capture whether the whale override actually applies to THIS job into a
+        # plain local -- it is visible in the got_response() closure below, where
+        # the stale-tip sibling refusal consults it. Override magnitude is
+        # unchanged (still 2**256-1, still clamped at data.py:857).
+        whale_override_applied = (self._detect_whale_departure()
+                                  and local_hash_rate_for_guard >= self._whale_min_local_hashrate
+                                  and not self._override_dead_majority())
+        if whale_override_applied:
+            desired_share_target = 2**256 - 1  # will be clamped to pre_target3 (easiest)
+        elif self._detect_whale_departure() and time.time() - self._whale_last_no_local_log > 30:
+            self._whale_last_no_local_log = time.time()
+            metrics = self._whale_last_metrics or {}
+            if self._override_dead_majority():
+                # Self-heal: detector still armed, but own production is majority
+                # dead -- the override is structurally disabled until it recovers.
+                rate, _dm = self._override_gov._windowed_orphan()
+                print '[WHALE-DEPARTURE] ACTIVE but override DISABLED (self-heal): own_dead=%.2f >= ceiling=%.2f (ratio=%.2f gap=%.0fs src=%s)' % (
+                    (rate if rate is not None else -1.0),
+                    self._override_gov.ORPHAN_CEILING,
+                    metrics.get('ratio', 0),
+                    metrics.get('share_gap', 0),
+                    metrics.get('source', 'unknown'))
+            else:
                 print '[WHALE-DEPARTURE] ACTIVE but override skipped: local=%sH/s < %.1fMH/s (ratio=%.2f gap=%.0fs src=%s)' % (
                     _fmt_hr(local_hash_rate_for_guard),
                     self._whale_min_local_hashrate/1e6,
                     metrics.get('ratio', 0),
                     metrics.get('share_gap', 0),
                     metrics.get('source', 'unknown'))
+
+        # v36-0.21: serve-side easing clamp -- the consensus-safe replacement for
+        # the un-shipped emergency-decay clamp. While the tip is stale (the hold
+        # has RESUMED serving via the majority/duration escape above, or is about
+        # to on a non-PERSIST/solo node), cap the SERVED target at 4x the tip's
+        # own target so this node never MINTS flood-diff work off a dead tip.
+        # Only ever hardens the served share -> byte-identical share verification
+        # network-wide (data.py generate_transaction is untouched). No-op when the
+        # tip is fresh.
+        desired_share_target = self._clamp_stale_tip_serve_target(desired_share_target, previous_share)
 
         if True:
             # Build share_data differently based on share version
@@ -2688,7 +3100,12 @@ class WorkerBridge(worker_interface.WorkerBridge):
                 )(*self.get_stale_counts()),
                 desired_version=desired_ver,  # From AutoRatchet: always 36 (signals V36 capability)
             )
-            
+
+            # Job parent captured for the stale-tip sibling refusal (see the share
+            # gate in got_response). Read directly from share_data_base so refusal
+            # does not depend on the share_info dict shape.
+            job_prev = share_data_base['previous_share_hash']
+
             if share_type.VERSION >= 36:
                 # V36: store pubkey_hash as IntType(160) + pubkey_type (1 byte)
                 share_data_base['pubkey_hash'] = pubkey_hash
@@ -3660,7 +4077,9 @@ class WorkerBridge(worker_interface.WorkerBridge):
             # Share.__init__ reconstructs gentx and this should now work correctly.
             # CRITICAL: Only attempt share creation if merkle_root matches current work template!
             # If work_merkle_root != header['merkle_root'], the submitted work is stale (from old template)
-            if pow_hash <= share_info['bits'].target and header_hash not in received_header_hashes and work_merkle_root == header['merkle_root']:
+            if pow_hash <= share_info['bits'].target and header_hash not in received_header_hashes \
+               and work_merkle_root == header['merkle_root'] \
+               and not (whale_override_applied and self._share_job_lags_tip(job_prev)):
                 last_txout_nonce = pack.IntType(8*self.COINBASE_NONCE_LENGTH).unpack(coinbase_nonce)
                 try:
                     share = get_share(header, last_txout_nonce)
@@ -3718,6 +4137,22 @@ class WorkerBridge(worker_interface.WorkerBridge):
                 self.local_rate_monitor.add_datum(dict(work=bitcoin_data.target_to_average_attempts(effective_target), dead=not on_time, user=user, share_target=share_info['bits'].target))
                 self.local_addr_rate_monitor.add_datum(dict(work=bitcoin_data.target_to_average_attempts(effective_target), pubkey_hash=pubkey_hash))
                 received_header_hashes.add(header_hash)
+            elif whale_override_applied and self._share_job_lags_tip(job_prev) \
+                 and pow_hash <= share_info['bits'].target and work_merkle_root == header['merkle_root']:
+                # STALE-TIP SIBLING REFUSAL (mandate 3): in easy-target whale mode,
+                # this job's parent (job_prev) lags the current best by >1 -- best has
+                # already been extended past a normal one-step drift. Minting here would
+                # add a sibling of an already-extended tip, i.e. an orphan that carries
+                # no PPLNS weight and feeds the flood. Refuse to mint. The work is still
+                # counted as DEAD local hashrate so own_hr stays honest, and this branch
+                # sits BELOW both block-submit paths (LTC ~3012 / DOGE aux ~3125+), so no
+                # block can be lost by refusing. Reached ONLY in easy mode with lag>1;
+                # the normal path (whale_override_applied False) never enters here.
+                self._whale_refused_siblings += 1
+                self.local_rate_monitor.add_datum(dict(
+                    work=bitcoin_data.target_to_average_attempts(share_info['bits'].target),
+                    dead=True, user=user, share_target=share_info['bits'].target))
+                print '[WHALE-SIBLING-REFUSED] job_prev lags best by >1 in easy mode; not minting'
             elif pow_hash <= share_info['bits'].target and work_merkle_root != header['merkle_root']:
                 # Stale work - share meets P2Pool difficulty but merkle_root mismatch
                 # This means the miner submitted work based on an old template
